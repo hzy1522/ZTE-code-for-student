@@ -7,6 +7,8 @@ Agent 派生类实现
 1. 优化 system prompt，详细说明坐标系统
 2. 利用历史消息帮助模型理解任务进度
 3. 更好的输出格式引导
+4. 增加 CLICK vs TYPE 决策指导
+5. 增加任务完成判断指导
 """
 
 import re
@@ -32,7 +34,8 @@ class Agent(BaseAgent):
     改进点：
     1. 优化 prompt，引导模型更准确地理解界面和坐标
     2. 利用历史动作帮助模型理解当前进度
-    3. 增强输出格式解析的鲁棒性
+    3. 增强 CLICK vs TYPE 决策指导
+    4. 增强任务完成判断
     """
 
     def __init__(self, config: Dict[str, Any] = None):
@@ -40,6 +43,32 @@ class Agent(BaseAgent):
         super().__init__(config)
         self._last_action = None
         self._last_params = None
+
+    def _call_api(self, messages: List[Dict[str, Any]], **kwargs) -> Any:
+        """
+        重写 API 调用方法，使用 vision 模型
+        """
+        from openai import OpenAI
+
+        client = OpenAI(
+            base_url=self._api_url,
+            api_key=self._api_key
+        )
+
+        logger.info(f"[API调用] model={self._model_id}, url={self._api_url}")
+
+        # 使用父类的调用方式，thinking 禁用
+        completion = client.chat.completions.create(
+            model=self._model_id,
+            messages=messages,
+            extra_body={
+                "thinking": {
+                    "type": "disabled"
+                }
+            }
+        )
+
+        return completion
 
     def act(self, input_data: AgentInput) -> AgentOutput:
         """
@@ -91,7 +120,7 @@ class Agent(BaseAgent):
         """
         生成发给大模型的 messages
 
-        改进版本：包含历史消息帮助模型理解上下文
+        包含历史但保持简洁
         """
         # 构建系统提示
         system_prompt = self._build_system_prompt(input_data.instruction)
@@ -105,13 +134,19 @@ class Agent(BaseAgent):
             "text": f"用户任务: {input_data.instruction}"
         })
 
-        # 添加历史动作摘要
+        # 添加历史动作（如果存在）
         if input_data.history_actions:
-            history_text = self._build_history_summary(input_data.history_actions)
-            current_content.append({
-                "type": "text",
-                "text": f"历史动作摘要:\n{history_text}"
-            })
+            history_text = "已完成的动作:\n"
+            for h in input_data.history_actions[-3:]:  # 只取最近3步
+                action = h.get('action', '')
+                params = h.get('parameters', {})
+                if action == 'CLICK':
+                    history_text += f"- CLICK {params.get('point')}\n"
+                elif action == 'TYPE':
+                    history_text += f"- TYPE '{params.get('text', '')[:20]}'\n"
+                elif action == 'OPEN':
+                    history_text += f"- OPEN {params.get('app_name')}\n"
+            current_content.append({"type": "text", "text": history_text})
 
         # 添加步骤计数
         current_content.append({
@@ -138,17 +173,22 @@ class Agent(BaseAgent):
 
         改进版本：更详细地说明坐标系统和输出格式
         """
-        return """你是一个手机GUI操作助手，负责根据用户指令和当前屏幕截图，完成手机操作任务。
+        return f"""你是一个手机GUI操作助手，负责根据用户指令和当前屏幕截图，完成手机操作任务。
 
 ## 任务说明
 你将看到手机屏幕截图，需要根据用户指令执行正确的操作。
 
-## 坐标系统 - 非常重要！
-屏幕坐标范围是 [0, 1000]，即：
+## 坐标系统 - 非常重要！！！
+屏幕坐标范围是 [0, 1000]：
 - 左上角坐标是 [0, 0]
 - 右下角坐标是 [1000, 1000]
-- x轴从左到右，y轴从上到下
-- 当你需要点击时，必须输出目标位置的精确坐标
+- x轴从左到右（屏幕左侧x小，右侧x大）
+- y轴从上到下（屏幕顶部y小，底部y大）
+
+**关键：y轴向下增长！**
+- 屏幕顶部的按钮/搜索栏：y ≈ 50-150
+- 屏幕中部的列表/内容：y ≈ 300-600
+- 屏幕底部的导航/菜单：y ≈ 850-950
 
 ## 操作类型
 1. CLICK - 点击操作：需要输出目标点的 [x, y] 坐标
@@ -219,13 +259,13 @@ class Agent(BaseAgent):
         解析大模型原始输出，提取动作和参数
 
         支持多种输出格式的解析：
-        1. 标准格式: "CLICK:[[x, y]]"
-        2. 函数调用格式: "CLICK(point=\"<point>x y</point>\")"
-        3. Action 章节格式: "Action: CLICK(...)"
+        1. 函数调用格式: "Action: click(point='<point>x y</point>')"
+        2. 赛题指定格式: "CLICK:[[x, y]]"
+        3. 中文描述格式: "点击 <point>x y</point> 位置" 或 "点击坐标(x, y)"
         """
         raw_output = raw_output.strip()
 
-        # 方式1: 函数调用格式 (带 <point> 标签的)
+        # 方式1: 函数调用格式 (带 <point> 标签的) - 最标准格式
         func_patterns = {
             'CLICK': r'click\s*\(\s*point\s*=\s*"?\s*<point>\s*([\d.]+)\s+([\d.]+)\s*</point>\s*"?\s*\)',
             'TYPE': r'type\s*\(\s*content\s*=\s*["\']([^"\']+)["\']\s*\)',
@@ -240,7 +280,28 @@ class Agent(BaseAgent):
                 params = self._parse_funcall_params(action_name, match)
                 return action_name, params
 
-        # 方式2: 赛题指定格式 "ACTION:[[...]]" 或 "ACTION:[...]"
+        # 方式2: 从 "Action: CLICK(...)" 格式提取
+        action_match = re.search(r'Action:\s*(\w+)', raw_output, re.IGNORECASE)
+        if action_match:
+            action_name = action_match.group(1).upper()
+            if action_name in VALID_ACTIONS:
+                params = self._extract_action_params(raw_output, action_name)
+                if params:
+                    return action_name, params
+                # TYPE/OPEN/COMPLETE 可能没有参数
+                if action_name in [ACTION_COMPLETE, ACTION_OPEN, ACTION_TYPE]:
+                    if action_name == ACTION_TYPE:
+                        # 尝试从内容中提取文本
+                        text_match = re.search(r'content\s*=\s*["\']([^"\']+)["\']', raw_output)
+                        if text_match:
+                            return action_name, {"text": text_match.group(1)}
+                    if action_name == ACTION_OPEN:
+                        app_match = re.search(r'app_name\s*=\s*["\']([^"\']+)["\']', raw_output)
+                        if app_match:
+                            return action_name, {"app_name": app_match.group(1)}
+                    return action_name, {}
+
+        # 方式3: 赛题指定格式 "ACTION:[[...]]" 或 "ACTION:[...]"
         # 特殊处理 SCROLL，因为包含嵌套括号
         scroll_match = re.search(r'SCROLL:\s*(\[\[[^\]]*\],\s*\[[^\]]*\]\])', raw_output.upper())
         if scroll_match:
@@ -262,15 +323,23 @@ class Agent(BaseAgent):
                 if params is not None:
                     return action, params
 
-        # 方式3: 从 "Action: CLICK(...)" 格式提取
-        action_match = re.search(r'Action:\s*(\w+)', raw_output, re.IGNORECASE)
-        if action_match:
-            action_name = action_match.group(1).upper()
-            if action_name in VALID_ACTIONS:
-                params = self._extract_action_params(raw_output, action_name)
-                if params:
-                    return action_name, params
-                return action_name, {}
+        # 方式4: 从中文描述中提取坐标
+        # 匹配 "点击 <point>x y</point>" 或 "点击坐标(x, y)" 或 "坐标为 x y"
+        point_match = re.search(r'<point>\s*([\d.]+)\s+([\d.]+)\s*</point>', raw_output)
+        if point_match:
+            x, y = int(float(point_match.group(1))), int(float(point_match.group(2)))
+            # 检查是否在合理范围内
+            if 0 <= x <= 1000 and 0 <= y <= 1000:
+                logger.info(f"[Agent] Extracted CLICK from narrative: ({x}, {y})")
+                return ACTION_CLICK, {"point": [x, y]}
+
+        # 匹配 "点击坐标(x, y)" 或 "坐标(x, y)"
+        coord_match = re.search(r'坐标\s*[\(（]\s*(\d+)\s*,\s*(\d+)\s*[\)）]', raw_output)
+        if coord_match:
+            x, y = int(coord_match.group(1)), int(coord_match.group(2))
+            if 0 <= x <= 1000 and 0 <= y <= 1000:
+                logger.info(f"[Agent] Extracted CLICK from coord: ({x}, {y})")
+                return ACTION_CLICK, {"point": [x, y]}
 
         # 解析失败
         logger.warning(f"[Agent] Failed to parse output: {raw_output[:200]}")

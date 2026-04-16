@@ -70,9 +70,10 @@ class ConfigTamperError(Exception):
 #               固定 API 配置
 # ==========================================
 # 模块级常量
-DEFAULT_API_URL = "https://ark.cn-beijing.volces.com/api/v3"
-DEFAULT_MODEL_ID = "doubao-seed-1-6-vision-250815"
-
+# DEFAULT_API_URL = "https://ark.cn-beijing.volces.com/api/v3"
+# DEFAULT_MODEL_ID = "doubao-seed-1-6-vision-250815"
+DEFAULT_API_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
+DEFAULT_MODEL_ID = "doubao-seed-2.0-pro"
 
 def _is_production_mode() -> bool:
     """检查是否为提交阶段（生产模式）"""
