@@ -80,11 +80,24 @@ class Agent(BaseAgent):
             }
         ]
 
-        # 添加简洁的历史信息
+        # 添加详细的历史信息，帮助理解上下文
         if input_data.history_actions:
-            history_text = "已完成: " + ", ".join([
-                f"{h.get('action', '')}" for h in input_data.history_actions[-3:]
-            ])
+            history_parts = []
+            for h in input_data.history_actions[-4:]:
+                action = h.get('action', '')
+                params = h.get('params', {})
+                if action == 'CLICK' and 'point' in params:
+                    history_parts.append('点击位置')
+                elif action == 'TYPE' and 'text' in params:
+                    text = params['text']
+                    history_parts.append(f'输入"{text[:10]}{"..." if len(text)>10 else ""}"')
+                elif action == 'OPEN' and 'app_name' in params:
+                    history_parts.append(f'打开{params["app_name"]}')
+                elif action == 'COMPLETE':
+                    history_parts.append('完成')
+                else:
+                    history_parts.append(action)
+            history_text = "历史: " + " → ".join(history_parts)
             current_content.append({"type": "text", "text": history_text})
 
         return [
