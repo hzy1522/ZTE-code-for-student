@@ -1,0 +1,328 @@
+# GUI Agent 算法设计说明文档
+
+## 1. 概述
+
+本项目实现了一个基于多模态大模型的 GUI Agent，用于完成手机端的自动化操作任务。Agent 通过分析手机屏幕截图，理解用户指令，并生成相应的操作动作（点击、输入、滚动、打开应用、完成）等。
+
+## 2. 系统架构
+
+### 2.1 整体架构
+
+```
+用户指令 + 手机截图
+       ↓
+   AgentInput
+       ↓
+┌─────────────────────────┐
+│  generate_messages      │
+│  - 动态 Task-Type 检测   │
+│  - 构建自适应提示词      │
+│  - 添加历史上下文        │
+│  - 编码截图             │
+└───────────┬─────────────┘
+            ↓
+┌─────────────────────────┐
+│   LLM API 调用          │
+│  (Volcano Engine)       │
+└───────────┬─────────────┘
+            ↓
+┌─────────────────────────┐
+│  _parse_output          │
+│  - 结构化 JSON 解析      │
+│  - 多格式回退           │
+└───────────┬─────────────┘
+            ↓
+      AgentOutput
+      (action + parameters)
+```
+
+### 2.2 核心组件
+
+1. **BaseAgent**: 基础抽象类，定义 Agent 接口和 API 调用保护机制
+2. **Agent**: 具体实现类，继承 BaseAgent，实现 `act()` 方法
+3. **AgentInput/AgentOutput**: 数据结构，封装输入输出
+4. **TaskDetector**: 任务类型检测器，识别 SEARCH/NAVIGATION/CONTENT/SHOPPING/TRANSPORT
+5. **OutputParser**: 结构化输出解析器，JSON 优先，正则回退
+6. **ActionHistoryAnalyzer**: 历史动作分析器，检测失败模式
+
+### 2.3 任务类型枚举
+
+```python
+class TaskType(Enum):
+    SEARCH = "search"           # 搜索类任务
+    NAVIGATION = "navigation"   # 导航/tab切换
+    CONTENT_INTERACT = "content"  # 内容交互（播放/收藏/点赞）
+    SHOPPING = "shopping"       # 外卖/电商
+    TRANSPORT = "transport"     # 打车/交通
+    MIXED = "mixed"             # 混合任务
+```
+
+## 3. 核心算法
+
+### 3.1 任务类型检测 (TaskDetector)
+
+通过正则匹配和关键词识别判断任务类型：
+
+```python
+def detect(self, instruction: str) -> TaskType:
+    # 1. 优先匹配APP特定模式
+    for app, task_type in self.APP_PATTERNS.items():
+        if app in instruction:
+            return task_type
+
+    # 2. 通用模式匹配
+    for task_type, patterns in self.TASK_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, instruction.lower()):
+                return task_type
+
+    return TaskType.MIXED
+```
+
+**APP模式映射**:
+- 芒果TV/抖音/快手/哔哩哔哩/腾讯视频/爱奇艺/喜马拉雅 → CONTENT_INTERACT
+- 美团/大众点评/京东/淘宝/拼多多/去哪旅行 → SHOPPING
+- 百度地图/高德地图/滴滴 → TRANSPORT
+
+### 3.2 动态提示词构建 (_build_adaptive_prompt)
+
+根据任务类型动态组合提示词模块：
+
+```python
+def _build_adaptive_prompt(self, instruction: str, task_type: TaskType, step_count: int) -> str:
+    parts = [
+        f"任务：{instruction}",
+        CORE_RULES,                    # 始终保留的核心规则
+        TASK_SPECIFIC_RULES[task_type], # 任务特定规则
+        STEP_GUIDANCE[step_count],     # 步骤指导
+        OUTPUT_FORMAT                  # 输出格式
+    ]
+    return "\n".join(parts)
+```
+
+**核心规则 (CORE_RULES)**:
+- 坐标规范: 归一化范围 [0, 1000]
+- 核心交互原则: 输入前必须点击输入框、出现下拉列表必须点击列表项
+- 任务完成标准: 不同类型任务有不同的完成条件
+
+**任务特定规则示例**:
+
+| 任务类型 | 关键规则 |
+|---------|---------|
+| SEARCH | 先点搜索入口 → 输入 → 候选列表出现则点击列表项 |
+| SHOPPING | 点击搜索框 → 输入 → 点列表项 → 添加商品 → 立即结算 |
+| TRANSPORT | 百度地图上方是出发地、下方是目的地，严格按顺序 |
+| CONTENT_INTERACT | 收藏/点赞类必须执行操作，不能仅完成前置步骤 |
+
+### 3.3 历史动作分析 (ActionHistoryAnalyzer)
+
+分析历史动作，检测失败模式并生成警告：
+
+```python
+class ActionHistoryAnalyzer:
+    COORD_THRESHOLD = 80  # 距离阈值
+
+    def analyze(self, history_actions: List[Dict]) -> HistoryAnalysis:
+        # 检测相似位置重复失败
+        # 检测连续多次 CLICK 失败
+        # 生成警告信息注入 prompt
+```
+
+**警告类型**:
+- "检测到点击相似位置但未成功，请重新分析目标元素位置"
+- "近期有多次失败动作，请仔细观察当前页面"
+- "连续多次点击未成功，请确认点击位置是否正确"
+
+### 3.4 输出解析 (OutputParser)
+
+采用分层解析策略：
+
+```python
+def parse(self, raw_output: str) -> Tuple[str, Dict[str, Any]]:
+    # 策略1: JSON 解析 (首选)
+    action, params = self._try_json(raw_output)
+    if action:
+        return action, params
+
+    # 策略2: 结构化格式 CLICK:[[x, y]]
+    action, params = self._try_structured(raw_output)
+    if action:
+        return action, params
+
+    # 策略3: 简化正则
+    action, params = self._try_regex(raw_output)
+    if action:
+        return action, params
+
+    # 策略4: 中文关键词 (最后回退)
+    action, params = self._try_chinese(raw_output)
+```
+
+**JSON 格式**:
+```json
+{"action": "CLICK", "params": {"point": [500, 300]}}
+{"action": "TYPE", "params": {"text": "搜索内容"}}
+{"action": "OPEN", "params": {"app_name": "美团"}}
+{"action": "COMPLETE", "params": {}}
+```
+
+**结构化格式**:
+```
+CLICK:[[x, y]]
+TYPE:["文字"]
+OPEN:["应用名"]
+COMPLETE:[]
+```
+
+### 3.5 消息生成 (generate_messages)
+
+整合所有组件生成完整的对话消息：
+
+```python
+def generate_messages(self, input_data: AgentInput) -> List[Dict[str, Any]]:
+    # 1. 检测任务类型
+    task_type = self._task_detector.detect(input_data.instruction)
+
+    # 2. 构建自适应提示词
+    system_prompt = self._build_adaptive_prompt(
+        input_data.instruction, task_type, input_data.step_count
+    )
+
+    # 3. 分析历史动作
+    history_analysis = self._history_analyzer.analyze(input_data.history_actions)
+
+    # 4. 构建用户消息
+    current_content = [
+        {"type": "text", "text": f"任务: {input_data.instruction}"},
+        {"type": "text", "text": f"第{input_data.step_count}步"},
+        {"type": "image_url", "image_url": {"url": self._encode_image(input_data.current_image)}}
+    ]
+
+    # 添加历史上下文（最近8步）
+    if input_data.history_actions:
+        history_text = self._format_history_context(
+            input_data.history_actions[-8:], history_analysis
+        )
+        current_content.append({"type": "text", "text": history_text})
+
+    # 添加警告
+    if history_analysis.warnings:
+        current_content.append({
+            "type": "text",
+            "text": "【注意】" + "；".join(history_analysis.warnings)
+        })
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": current_content}
+    ]
+```
+
+## 4. 坐标系统
+
+- 屏幕坐标范围: **[0, 1000]** 归一化
+- 坐标系: 左上角为原点，x 轴向右，y 轴向下
+- **y轴向下增长**：屏幕底部y值接近1000，顶部y值接近0
+- 点击目标: 元素中心点的坐标
+
+**归一化坐标参考**:
+- y ≈ 0-150: 屏幕顶部（搜索栏、标题栏）
+- y ≈ 150-850: 屏幕中部（列表、视频、商品）
+- y ≈ 850-1000: 屏幕底部（导航栏、结算按钮）
+
+## 5. API 调用
+
+### 5.1 模型配置
+
+- **模型**: Doubao-Seed-2.0-Vision (多模态模型)
+- **API Endpoint**: https://ark.cn-beijing.volces.com/api/v3
+- **Temperature**: 0 (确定性输出，保证结果可复现)
+
+### 5.2 调用方式
+
+```python
+def _call_api(self, messages: List[Dict], **kwargs) -> Any:
+    return super()._call_api(messages, temperature=0)
+```
+
+## 6. 关键设计决策
+
+### 6.1 动态提示词策略
+
+将规则按任务类型模块化，避免单一提示词过于冗长：
+- CORE_RULES: 所有任务共享的核心规则
+- TASK_SPECIFIC_RULES: 按任务类型选择对应的规则集
+- 步骤指导根据 step_count 动态调整
+
+### 6.2 历史上下文增强
+
+- 显示最近 8 步历史动作（之前为 4 步）
+- 每条动作标注"成功/失败"状态
+- 自动分析失败模式并注入警告到 prompt
+
+### 6.3 结构化输出优先
+
+使用 JSON 作为首选输出格式，提高解析可靠性：
+- JSON 格式可明确表达动作类型和参数
+- 多层回退机制保证鲁棒性
+- 支持嵌套结构（如 SCROLL 的 start_point/end_point）
+
+### 6.4 安全性设计
+
+- **配置签名验证**: 防止运行时篡改 API 配置
+- **敏感参数过滤**: 禁止通过 kwargs 传入敏感参数
+- **受保护的 API 调用**: 所有 API 调用必须通过 `_call_api()` 方法
+
+## 7. 测试结果
+
+### 7.1 性能指标
+
+- **步骤准确率**: ~82%
+- **用例准确率**: ~36-45% (4-5/11 测试用例通过)
+
+### 7.2 通过的测试用例
+
+典型用例:
+- step_bilibili_onekey_0008 (搜索并收藏)
+- step_baidumap_onekey_0008 (百度地图语音包)
+- step_kuaishou_onekey_0003 (快手搜索筛选)
+- step_mangguo_onekey_0008 (芒果TV播放下载)
+
+### 7.3 性能分析
+
+步骤准确率 ~82% 与用例准确率 ~40% 是一致的：
+- 一个用例平均约 8-10 步
+- 全对的概率约为 0.82^9 ≈ 26%
+- 实际 36-45% 说明部分用例步骤较少，或模型在简单用例上表现更好
+
+### 7.4 主要失败原因
+
+1. **坐标预测误差**: Vision 模型对元素位置判断有固有误差
+2. **复杂任务规划**: 多步骤任务累计误差较大
+3. **页面状态理解**: 对下拉列表、弹窗等状态判断不准确
+
+## 8. 改进方向
+
+### 8.1 已实施的改进
+
+1. **动态 Task-Type 检测**: 根据指令识别任务类型，加载对应规则
+2. **结构化 JSON 输出**: 提高解析可靠性
+3. **历史模式分析**: 检测重复失败模式，自我校正
+4. **增强的历史上下文**: 显示更多历史信息，标注成功/失败
+
+### 8.2 未来改进方向
+
+1. **更精确的坐标预测**: 引入目标检测模型辅助定位
+2. **Few-shot Learning**: 提供示例坐标辅助模型理解
+3. **错误恢复机制**: 失败后分析原因并重新规划
+4. **屏幕元素识别**: 结合 UI 元素检测模型提高定位精度
+5. **多轮对话增强**: 利用更长的历史上下文改善理解
+
+## 9. 依赖说明
+
+- `openai` / `requests`: API 调用
+- `PIL (Pillow)`: 图片处理
+- `base64`: 图片编码
+- `json`/`re`: 响应解析
+- `numpy`: 坐标计算
+- `logging`: 日志记录
