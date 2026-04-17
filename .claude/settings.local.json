@@ -6,7 +6,9 @@
       "Bash(pip install *)",
       "Bash(pip3 install *)",
       "Bash(env)",
-      "Bash(VLM_API_KEY=sk-7e143b36a2514c8a8ef07b404ac6d0fd python test_runner.py)"
+      "Bash(VLM_API_KEY=sk-7e143b36a2514c8a8ef07b404ac6d0fd python test_runner.py)",
+      "Bash(VLM_API_KEY=3ba5c624-c86e-49d3-9e46-9d9cef3e56d9 python test_runner.py)",
+      "Bash(python -c ' *)"
     ]
   }
 }
