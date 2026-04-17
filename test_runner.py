@@ -484,9 +484,12 @@ class TestRunner:
 
         # 读取 ref.json
         ref_data = self._load_ref_data(screenshots_dir)
-        
+
         # 获取初始状态和指令
         first_status, instruction, step_max = self._get_initial_info(ref_data)
+
+        logger.info(f"[Case Info] instruction={instruction}")
+        logger.info(f"[Case Info] first_status={first_status}, max_steps={step_max}")
         
         current_status = next_status = first_status
         step_count = 1
@@ -515,10 +518,19 @@ class TestRunner:
             try:
                 # 每步开始前验证配置
                 self._validate_agent_config(self.agent)
-                
+
+                # 打印发送给 Agent 的信息
+                logger.info(f"[Agent Input] step={step_count}, instruction={instruction[:80]}...")
+                logger.info(f"[Agent Input] history_actions_count={len(history_actions)}")
+
                 agent_output = self.agent.act(agent_input)
+
+                # 打印 Agent 输出详情
+                logger.info(f"[Agent Raw Output] {agent_output.raw_output[:200] if agent_output.raw_output else 'Empty'}")
                 logger.info(f"Agent Output: action={agent_output.action}, params={agent_output.parameters}")
-                
+                if agent_output.usage:
+                    logger.info(f"[Agent Usage] input={agent_output.usage.input_tokens}, output={agent_output.usage.output_tokens}, total={agent_output.usage.total_tokens}")
+
                 # 每步结束后验证配置（检测运行时篡改）
                 self._validate_agent_config(self.agent)
                 
@@ -542,6 +554,10 @@ class TestRunner:
                 ref_data, current_status, screenshot.width, screenshot.height,
                 agent_output.action, agent_output.parameters
             )
+
+            # 打印期望值（方便调试对比）
+            logger.info(f"[Expected] status={current_status}, action={ref_action_list}, params={ref_params_list}")
+            logger.info(f"[Result] is_ok={is_ok}, next_status={matched_next_status}")
             
             # 4. 更新历史（使用标准 OpenAI messages 格式）
             # 添加用户消息（包含当前截图）
@@ -598,7 +614,12 @@ class TestRunner:
                         next_status = '#'
             
             step_count += 1
-        
+
+        # 打印步骤执行摘要
+        total_steps = len(steps_record)
+        valid_steps = sum(1 for s in steps_record if s.get('check_result', False))
+        logger.info(f"[Step Summary] total_steps={total_steps}, valid_steps={valid_steps}, last_status={current_status}")
+
         # 生成可视化
         visualization_path = ''
         if self.visualizer and steps_record:

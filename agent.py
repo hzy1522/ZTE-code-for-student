@@ -3,12 +3,10 @@ Agent 派生类实现
 
 选手需要实现自己的 Agent，继承 BaseAgent 并实现 act 方法。
 
-改进版本：
-1. 优化 system prompt，详细说明坐标系统
-2. 利用历史消息帮助模型理解任务进度
-3. 更好的输出格式引导
-4. 增加 CLICK vs TYPE 决策指导
-5. 增加任务完成判断指导
+通用策略版本：
+1. 简洁的 prompt - 通用规则，不偏向特定用例
+2. temperature=0 - 最小化随机性
+3. 稳定的输出格式
 """
 
 import re
@@ -17,9 +15,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from agent_base import (
-    BaseAgent, AgentInput, AgentOutput,
-    ACTION_CLICK, ACTION_SCROLL, ACTION_TYPE, ACTION_OPEN, ACTION_COMPLETE,
-    VALID_ACTIONS, UsageInfo
+    BaseAgent, AgentInput, AgentOutput
 )
 
 logger = logging.getLogger(__name__)
@@ -29,13 +25,10 @@ class Agent(BaseAgent):
     """
     GUI Agent 实现类
 
-    继承 BaseAgent，实现根据用户指令和当前截图生成动作。
-
-    改进点：
-    1. 优化 prompt，引导模型更准确地理解界面和坐标
-    2. 利用历史动作帮助模型理解当前进度
-    3. 增强 CLICK vs TYPE 决策指导
-    4. 增强任务完成判断
+    通用策略：
+    1. 简洁 prompt - 只包含必要的通用规则
+    2. temperature=0 - 确定性输出
+    3. 清晰的动作格式指导
     """
 
     def __init__(self, config: Dict[str, Any] = None):
@@ -45,61 +38,23 @@ class Agent(BaseAgent):
         self._last_params = None
 
     def _call_api(self, messages: List[Dict[str, Any]], **kwargs) -> Any:
-        """
-        重写 API 调用方法，使用 vision 模型
-        """
-        from openai import OpenAI
-
-        client = OpenAI(
-            base_url=self._api_url,
-            api_key=self._api_key
-        )
-
-        logger.info(f"[API调用] model={self._model_id}, url={self._api_url}")
-
-        # 使用父类的调用方式，thinking 禁用
-        completion = client.chat.completions.create(
-            model=self._model_id,
-            messages=messages,
-            extra_body={
-                "thinking": {
-                    "type": "disabled"
-                }
-            }
-        )
-
-        return completion
+        """调用 API - 使用父类的安全实现，temperature=0 最确定性"""
+        return super()._call_api(messages, temperature=0)
 
     def act(self, input_data: AgentInput) -> AgentOutput:
-        """
-        Agent 核心方法：根据输入生成动作
-
-        Args:
-            input_data: AgentInput 包含当前轮所有信息
-
-        Returns:
-            AgentOutput 包含动作和参数
-        """
-        # 1. 生成发送给大模型的 messages
+        """Agent 核心方法"""
         messages = self.generate_messages(input_data)
 
-        # 2. 调用大模型 API
         try:
             response = self._call_api(messages)
             raw_output = response.choices[0].message.content
-
-            # 3. 提取 Token 使用信息
             usage = self.extract_usage_info(response)
-
-            # 4. 解析输出为 action 和 parameters
             action, parameters = self._parse_output(raw_output)
 
-            # 5. 记录上一步动作，帮助调试
             self._last_action = action
             self._last_params = parameters
 
-            logger.info(f"[Agent] Parsed action: {action}, params: {parameters}")
-            logger.debug(f"[Agent] Raw output: {raw_output[:500]}")
+            logger.info(f"[Agent] {action} {parameters}")
 
             return AgentOutput(
                 action=action,
@@ -109,167 +64,76 @@ class Agent(BaseAgent):
             )
 
         except Exception as e:
-            logger.error(f"[Agent] Error calling API: {e}")
-            return AgentOutput(
-                action="",
-                parameters={},
-                raw_output=f"Error: {str(e)}"
-            )
+            logger.error(f"[Agent] Error: {e}")
+            return AgentOutput(action="", parameters={}, raw_output=f"Error: {str(e)}")
 
     def generate_messages(self, input_data: AgentInput) -> List[Dict[str, Any]]:
-        """
-        生成发给大模型的 messages
-
-        包含历史但保持简洁
-        """
-        # 构建系统提示
+        """生成 messages"""
         system_prompt = self._build_system_prompt(input_data.instruction)
 
-        # 构建当前轮消息
-        current_content = []
+        current_content = [
+            {"type": "text", "text": f"任务: {input_data.instruction}"},
+            {"type": "text", "text": f"第{input_data.step_count}步"},
+            {
+                "type": "image_url",
+                "image_url": {"url": self._encode_image(input_data.current_image)}
+            }
+        ]
 
-        # 添加任务指令
-        current_content.append({
-            "type": "text",
-            "text": f"用户任务: {input_data.instruction}"
-        })
-
-        # 添加历史动作（如果存在）
+        # 添加简洁的历史信息
         if input_data.history_actions:
-            history_text = "已完成的动作:\n"
-            for h in input_data.history_actions[-3:]:  # 只取最近3步
-                action = h.get('action', '')
-                params = h.get('parameters', {})
-                if action == 'CLICK':
-                    history_text += f"- CLICK {params.get('point')}\n"
-                elif action == 'TYPE':
-                    history_text += f"- TYPE '{params.get('text', '')[:20]}'\n"
-                elif action == 'OPEN':
-                    history_text += f"- OPEN {params.get('app_name')}\n"
+            history_text = "已完成: " + ", ".join([
+                f"{h.get('action', '')}" for h in input_data.history_actions[-3:]
+            ])
             current_content.append({"type": "text", "text": history_text})
 
-        # 添加步骤计数
-        current_content.append({
-            "type": "text",
-            "text": f"当前是第 {input_data.step_count} 步操作"
-        })
-
-        # 添加截图
-        current_content.append({
-            "type": "image_url",
-            "image_url": {"url": self._encode_image(input_data.current_image)}
-        })
-
-        messages = [
+        return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": current_content}
         ]
 
-        return messages
-
     def _build_system_prompt(self, instruction: str) -> str:
         """
-        构建系统提示词
-
-        改进版本：更详细地说明坐标系统和输出格式
+        通用 prompt - 包含通用交互原则和任务完成判断
         """
-        return f"""你是一个手机GUI操作助手，负责根据用户指令和当前屏幕截图，完成手机操作任务。
+        return f"""任务：{instruction}
 
-## 任务说明
-你将看到手机屏幕截图，需要根据用户指令执行正确的操作。
+## 屏幕结构
+- 顶部 (y 0-150)：搜索栏、标题栏
+- 内容 (y 150-850)：列表、视频、图片
+- 底部 (y 850-1000)：导航栏、按钮
 
-## 坐标系统 - 非常重要！！！
-屏幕坐标范围是 [0, 1000]：
-- 左上角坐标是 [0, 0]
-- 右下角坐标是 [1000, 1000]
-- x轴从左到右（屏幕左侧x小，右侧x大）
-- y轴从上到下（屏幕顶部y小，底部y大）
+## 坐标
+坐标范围 [0, 1000]，只输出整数。
 
-**关键：y轴向下增长！**
-- 屏幕顶部的按钮/搜索栏：y ≈ 50-150
-- 屏幕中部的列表/内容：y ≈ 300-600
-- 屏幕底部的导航/菜单：y ≈ 850-950
+## 交互原则
+1. 【强制】输入文字前必须先点击输入框/搜索框（即使认为不需要也要先点击）
+2. 选择内容时点在内容区域(y>150)，且必须点在图标/文字/按钮上，不能点在空白处
+3. 切换tab/导航时点在底部(y>850)
+4. 打开应用时应用名与图标文字完全一致
+5. 搜索结果页要点列表项，不是搜索栏
+6. 点击列表项时要点在文字或图标上，不要点在行与行之间的空白区域
 
-## 操作类型
-1. CLICK - 点击操作：需要输出目标点的 [x, y] 坐标
-2. TYPE - 输入文本：需要输出要输入的文本内容
-3. SCROLL - 滚动操作：需要输出起始点和结束点的坐标
-4. OPEN - 打开应用：需要输出应用名称
-5. COMPLETE - 任务完成：不需要任何参数
+## 任务完成判断
+当用户任务的所有要求都已执行完成时，输出 COMPLETE:[]。
+【重要】输入文字后，如果屏幕上有"发布"、"发送"、"提交"、"确认"等按钮，必须点击完成后才能 COMPLETE。
+【重要】如果任务要求已完成（如搜索结果已显示、筛选已设置、播放已开始），不要再点击任何元素，直接 COMPLETE。
+【重要】如果任务要求"收藏"、"点赞"、"关注"、"分享"等操作，必须执行该操作后才能 COMPLETE，不能仅完成前置步骤（如搜索）就结束。
 
-## 输出格式 - 必须严格遵守！
-每行只输出一个动作，格式如下：
-
-点击搜索框：CLICK:[[400, 150]]
-输入文字：TYPE:["北京"]
-打开应用：OPEN:["微信"]
-滚动屏幕：SCROLL:[[300, 800], [300, 200]]
-任务完成：COMPLETE:[]
-
-## 坐标获取技巧
-- 仔细观察截图中的可点击元素（按钮、输入框、图标等）
-- 估计元素中心点的坐标
-- 坐标必须是 [x, y] 格式的归一化坐标（0-1000范围）
-- 不要猜测，使用你观察到的实际位置
-
-## 任务执行策略
-1. 先理解用户想要完成什么任务
-2. 观察当前屏幕显示了什么
-3. 确定下一步应该执行什么操作
-4. 输出对应的动作和参数
-
-开始分析屏幕并执行任务！"""
-
-    def _build_history_summary(self, history_actions: List[Dict[str, Any]]) -> str:
-        """
-        构建历史动作摘要
-
-        帮助模型理解已经完成了哪些步骤，避免重复操作
-        """
-        if not history_actions:
-            return "（无历史动作）"
-
-        summary_parts = []
-        for i, action_info in enumerate(history_actions[-5:], 1):  # 只取最近5步
-            action = action_info.get('action', 'UNKNOWN')
-            params = action_info.get('parameters', {})
-
-            if action == ACTION_CLICK:
-                point = params.get('point', [0, 0])
-                summary_parts.append(f"{i}. CLICK 点击位置 {point}")
-            elif action == ACTION_TYPE:
-                text = params.get('text', '')[:20]
-                summary_parts.append(f"{i}. TYPE 输入 '{text}...'")
-            elif action == ACTION_OPEN:
-                app = params.get('app_name', '')
-                summary_parts.append(f"{i}. OPEN 打开 {app}")
-            elif action == ACTION_SCROLL:
-                start = params.get('start_point', [0, 0])
-                end = params.get('end_point', [0, 0])
-                summary_parts.append(f"{i}. SCROLL 从 {start} 到 {end}")
-            elif action == ACTION_COMPLETE:
-                summary_parts.append(f"{i}. COMPLETE 任务完成")
-            else:
-                summary_parts.append(f"{i}. {action} {params}")
-
-        return "\n".join(summary_parts)
+## 动作格式
+CLICK:[[x, y]]
+TYPE:["文字"]
+OPEN:["应用名"]
+COMPLETE:[]"""
 
     def _parse_output(self, raw_output: str) -> tuple:
-        """
-        解析大模型原始输出，提取动作和参数
-
-        支持多种输出格式的解析：
-        1. 函数调用格式: "Action: click(point='<point>x y</point>')"
-        2. 赛题指定格式: "CLICK:[[x, y]]"
-        3. 中文描述格式: "点击 <point>x y</point> 位置" 或 "点击坐标(x, y)"
-        """
+        """解析输出"""
         raw_output = raw_output.strip()
 
-        # 方式1: 函数调用格式 (带 <point> 标签的) - 最标准格式
+        # 函数调用格式
         func_patterns = {
             'CLICK': r'click\s*\(\s*point\s*=\s*"?\s*<point>\s*([\d.]+)\s+([\d.]+)\s*</point>\s*"?\s*\)',
             'TYPE': r'type\s*\(\s*content\s*=\s*["\']([^"\']+)["\']\s*\)',
-            'SCROLL': r'scroll\s*\(\s*start_point\s*=\s*"?\s*<point>\s*([\d.]+)\s+([\d.]+)\s*</point>\s*"?\s*,\s*end_point\s*=\s*"?\s*<point>\s*([\d.]+)\s+([\d.]+)\s*</point>\s*"?\s*\)',
             'OPEN': r'open\s*\(\s*app_name\s*=\s*["\']([^"\']+)["\']\s*\)',
             'COMPLETE': r'complete\s*\(\s*\)',
         }
@@ -277,188 +141,102 @@ class Agent(BaseAgent):
         for action_name, pattern in func_patterns.items():
             match = re.search(pattern, raw_output, re.IGNORECASE)
             if match:
-                params = self._parse_funcall_params(action_name, match)
-                return action_name, params
+                return self._parse_funcall_params(action_name, match)
 
-        # 方式2: 从 "Action: CLICK(...)" 格式提取
-        action_match = re.search(r'Action:\s*(\w+)', raw_output, re.IGNORECASE)
-        if action_match:
-            action_name = action_match.group(1).upper()
-            if action_name in VALID_ACTIONS:
-                params = self._extract_action_params(raw_output, action_name)
-                if params:
-                    return action_name, params
-                # TYPE/OPEN/COMPLETE 可能没有参数
-                if action_name in [ACTION_COMPLETE, ACTION_OPEN, ACTION_TYPE]:
-                    if action_name == ACTION_TYPE:
-                        # 尝试从内容中提取文本
-                        text_match = re.search(r'content\s*=\s*["\']([^"\']+)["\']', raw_output)
-                        if text_match:
-                            return action_name, {"text": text_match.group(1)}
-                    if action_name == ACTION_OPEN:
-                        app_match = re.search(r'app_name\s*=\s*["\']([^"\']+)["\']', raw_output)
-                        if app_match:
-                            return action_name, {"app_name": app_match.group(1)}
-                    return action_name, {}
-
-        # 方式3: 赛题指定格式 "ACTION:[[...]]" 或 "ACTION:[...]"
-        # 特殊处理 SCROLL，因为包含嵌套括号
-        scroll_match = re.search(r'SCROLL:\s*(\[\[[^\]]*\],\s*\[[^\]]*\]\])', raw_output.upper())
-        if scroll_match:
-            param_str = scroll_match.group(1)
-            params = self._parse_params(ACTION_SCROLL, param_str)
-            if params is not None:
-                return ACTION_SCROLL, params
-
-        for action in VALID_ACTIONS:
-            if action == ACTION_SCROLL:
-                continue
-            pattern = rf'{action}:\s*(\[[^\]]*\]|\{{[^{{]*\}}|\S+)'
-            upper_match = re.search(pattern, raw_output.upper())
-            if upper_match:
-                start_pos = upper_match.start(1)
-                end_pos = upper_match.end(1)
-                param_str = raw_output[start_pos:end_pos]
-                params = self._parse_params(action, param_str)
+        # ACTION:[[...]] 格式
+        for action in ['CLICK', 'TYPE', 'OPEN', 'COMPLETE']:
+            if action == 'CLICK':
+                pattern = rf'{action}:\s*(\[\[[^\]]+\]\])'
+            elif action == 'SCROLL':
+                pattern = rf'{action}:\s*(\[\[[^\]]+\],\s*\[[^\]]+\]\])'
+            else:
+                pattern = rf'{action}:\s*(\[[^\]]*\])'
+            match = re.search(pattern, raw_output.upper())
+            if match:
+                params = self._parse_params(action, match.group(1))
                 if params is not None:
                     return action, params
 
-        # 方式4: 从中文描述中提取坐标
-        # 匹配 "点击 <point>x y</point>" 或 "点击坐标(x, y)" 或 "坐标为 x y"
+        # SCROLL 格式
+        scroll_match = re.search(r'SCROLL:\s*(\[\[[^\]]*\],\s*\[[^\]]*\]\])', raw_output.upper())
+        if scroll_match:
+            params = self._parse_params('SCROLL', scroll_match.group(1))
+            if params:
+                return 'SCROLL', params
+
+        # 中文坐标 <point>x y</point>
         point_match = re.search(r'<point>\s*([\d.]+)\s+([\d.]+)\s*</point>', raw_output)
         if point_match:
             x, y = int(float(point_match.group(1))), int(float(point_match.group(2)))
-            # 检查是否在合理范围内
             if 0 <= x <= 1000 and 0 <= y <= 1000:
-                logger.info(f"[Agent] Extracted CLICK from narrative: ({x}, {y})")
-                return ACTION_CLICK, {"point": [x, y]}
+                return 'CLICK', {"point": [x, y]}
 
-        # 匹配 "点击坐标(x, y)" 或 "坐标(x, y)"
-        coord_match = re.search(r'坐标\s*[\(（]\s*(\d+)\s*,\s*(\d+)\s*[\)）]', raw_output)
-        if coord_match:
-            x, y = int(coord_match.group(1)), int(coord_match.group(2))
+        # 裸坐标格式 CLICK [x, y] 或 click [x y]
+        bare_point = re.search(r'\[?\s*([\d]{2,4})\s*,\s*([\d]{2,4})\s*\]?', raw_output, re.IGNORECASE)
+        if bare_point:
+            x, y = int(bare_point.group(1)), int(bare_point.group(2))
             if 0 <= x <= 1000 and 0 <= y <= 1000:
-                logger.info(f"[Agent] Extracted CLICK from coord: ({x}, {y})")
-                return ACTION_CLICK, {"point": [x, y]}
+                return 'CLICK', {"point": [x, y]}
 
-        # 解析失败
-        logger.warning(f"[Agent] Failed to parse output: {raw_output[:200]}")
+        # 中文动作关键词
+        if re.search(r'完成|结束了', raw_output):
+            return 'COMPLETE', {}
+        if re.search(r'输入|打字|填', raw_output):
+            text_match = re.search(r'["\"\']([^"\']+)["\'"]', raw_output)
+            if text_match:
+                return 'TYPE', {"text": text_match.group(1)}
+        if re.search(r'打开|启动|应用', raw_output):
+            app_match = re.search(r'["\"\']([^"\']+)["\'"]', raw_output)
+            if app_match:
+                return 'OPEN', {"app_name": app_match.group(1)}
+
+        logger.warning(f"[Agent] Parse failed: {raw_output[:100]}")
         return "", {}
 
     def _parse_params(self, action: str, param_str: str) -> Optional[Dict[str, Any]]:
-        """
-        根据动作类型解析参数字符串
-        """
+        """解析参数"""
         try:
-            if action == ACTION_CLICK:
+            if action == 'CLICK':
                 param_str = param_str.strip('[]')
-                coords = json.loads(f"[{param_str}]")
+                # 支持空格分隔和逗号分隔的坐标，先分割再清理
+                parts = [p.strip() for p in param_str.replace(' ', ',').split(',')]
+                coords = [int(p) for p in parts if p]
                 if len(coords) == 2:
                     return {"point": coords}
-                coords = [float(x.strip()) for x in param_str.replace('[', '').replace(']', '').split(',')]
-                if len(coords) == 2:
-                    return {"point": coords}
 
-            elif action == ACTION_TYPE:
-                text = param_str.strip("[]'\"")
-                return {"text": text}
+            elif action == 'TYPE':
+                return {"text": param_str.strip("[]'\"")}
 
-            elif action == ACTION_OPEN:
-                text = param_str.strip("[]'\"")
-                return {"app_name": text}
+            elif action == 'OPEN':
+                return {"app_name": param_str.strip("[]'\"")}
 
-            elif action == ACTION_SCROLL:
-                try:
-                    data = json.loads(param_str)
-                    if isinstance(data, list) and len(data) == 2:
-                        start, end = data
-                        if len(start) == 2 and len(end) == 2:
-                            return {"start_point": start, "end_point": end}
-                except:
-                    param_str = param_str.strip('[]')
-                    parts = param_str.split('],')
-                    if len(parts) >= 2:
-                        start = json.loads(parts[0] + ']')
-                        end = json.loads('[' + parts[1])
-                        if len(start) == 2 and len(end) == 2:
-                            return {"start_point": start, "end_point": end}
+            elif action == 'SCROLL':
+                # 支持空格分隔的坐标
+                param_str_normalized = param_str.replace(' ', ',')
+                data = json.loads(param_str_normalized)
+                if isinstance(data, list) and len(data) == 2:
+                    return {"start_point": data[0], "end_point": data[1]}
 
-            elif action == ACTION_COMPLETE:
+            elif action == 'COMPLETE':
                 return {}
 
-        except Exception as e:
-            logger.debug(f"[Agent] Failed to parse params for {action}: {e}")
+        except:
+            pass
         return None
 
-    def _extract_action_params(self, raw_output: str, action: str) -> Dict[str, Any]:
-        """
-        从原始输出中提取动作参数
-        """
-        params = {}
-
-        if action == ACTION_CLICK:
-            point_match = re.search(r'<point>\s*([\d.]+)\s+([\d.]+)\s*</point>', raw_output)
-            if point_match:
-                params["point"] = [int(float(point_match.group(1))), int(float(point_match.group(2)))]
-            else:
-                point_match = re.search(r'point\s*=\s*[\'"]?([^\)\'"\s]+)[\'"]?', raw_output)
-                if point_match:
-                    coords_str = point_match.group(1)
-                    coords_match = re.findall(r'\d+', coords_str)
-                    if len(coords_match) >= 2:
-                        params["point"] = [int(coords_match[0]), int(coords_match[1])]
-
-        elif action == ACTION_TYPE:
-            text_match = re.search(r'content\s*=\s*["\']([^"\']+)["\']', raw_output)
-            if text_match:
-                params["text"] = text_match.group(1)
-
-        elif action == ACTION_OPEN:
-            app_match = re.search(r'app_name\s*=\s*["\']([^"\']+)["\']', raw_output)
-            if app_match:
-                params["app_name"] = app_match.group(1)
-
-        elif action == ACTION_SCROLL:
-            matches = re.findall(r'<point>\s*([\d.]+)\s+([\d.]+)\s*</point>', raw_output)
-            if len(matches) >= 2:
-                params["start_point"] = [int(float(matches[0][0])), int(float(matches[0][1]))]
-                params["end_point"] = [int(float(matches[1][0])), int(float(matches[1][1]))]
-
-        elif action == ACTION_COMPLETE:
-            params = {}
-
-        return params
-
-    def _parse_coord_string(self, coord_str: str) -> List[int]:
-        """解析坐标字符串"""
-        coord_str = coord_str.strip('[]\s')
-        if ',' in coord_str:
-            parts = coord_str.split(',')
-        else:
-            parts = coord_str.split()
-        try:
-            return [int(float(p.strip())) for p in parts if p.strip()]
-        except:
-            return [0, 0]
-
     def _parse_funcall_params(self, action: str, match: re.Match) -> Dict[str, Any]:
-        """从正则匹配结果中提取函数调用参数"""
-        if action == ACTION_CLICK:
+        """解析函数调用参数"""
+        if action == 'CLICK':
             return {"point": [int(float(match.group(1))), int(float(match.group(2)))]}
-        elif action == ACTION_TYPE:
+        elif action == 'TYPE':
             return {"text": match.group(1)}
-        elif action == ACTION_OPEN:
+        elif action == 'OPEN':
             return {"app_name": match.group(1)}
-        elif action == ACTION_SCROLL:
-            return {
-                "start_point": [int(float(match.group(1))), int(float(match.group(2)))],
-                "end_point": [int(float(match.group(3))), int(float(match.group(4)))]
-            }
-        elif action == ACTION_COMPLETE:
+        elif action == 'COMPLETE':
             return {}
         return {}
 
     def reset(self):
-        """重置 Agent 状态"""
+        """重置状态"""
         self._last_action = None
         self._last_params = None
